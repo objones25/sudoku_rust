@@ -2,17 +2,28 @@
 //! 
 //! This program:
 //! 1. Fetches a new Sudoku puzzle from the Dosuku API
-//! 2. Solves it using recursive backtracking
+//! 2. Solves it using recursive backtracking with parallel processing
 //! 3. Verifies the solution against the API's solution
-//! 4. Displays both solutions if they differ
+//! 4. Checks for solution uniqueness
+//! 5. Displays both solutions if they differ
 
 use sudoku::{api, solver::Solver};
-use tracing::{info, error};
+use tracing::{info, error, Level};
+use tracing_subscriber::FmtSubscriber;
 
 #[tokio::main]
 async fn main() {
-    // Initialize logging
-    tracing_subscriber::fmt::init();
+    // Initialize logging with debug level
+    FmtSubscriber::builder()
+        .with_max_level(Level::DEBUG)
+        .with_thread_ids(true)
+        .with_file(true)
+        .with_line_number(true)
+        .with_target(false)
+        .with_thread_names(true)
+        .with_ansi(true)
+        .pretty()
+        .init();
 
     info!("Fetching new Sudoku board from API...");
     
@@ -33,6 +44,12 @@ async fn main() {
                         error!("❌ Our solution differs from API's solution!");
                         info!("API's solution:");
                         print_board(&solver.get_original_solution());
+                    }
+
+                    if solver.has_unique_solution() {
+                        info!("✅ This puzzle has a unique solution!");
+                    } else {
+                        info!("⚠️  This puzzle has multiple valid solutions!");
                     }
                 }
                 Err(e) => error!("Failed to solve board: {}", e),
