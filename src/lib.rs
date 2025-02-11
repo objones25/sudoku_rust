@@ -3,6 +3,7 @@ use thiserror::Error;
 
 pub mod solver;
 pub mod api;
+pub mod benchmark;
 
 #[derive(Debug, Error)]
 pub enum SudokuError {
@@ -16,6 +17,8 @@ pub enum SudokuError {
         col: usize,
         value: i32,
     },
+    #[error("Benchmark error: {0}")]
+    BenchmarkError(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

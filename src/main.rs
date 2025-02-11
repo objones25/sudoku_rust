@@ -7,9 +7,10 @@
 //! 4. Checks for solution uniqueness
 //! 5. Displays both solutions if they differ
 
-use sudoku::{api, solver::Solver};
+use sudoku::{api, solver::Solver, benchmark};
 use tracing::{info, error, Level};
 use tracing_subscriber::FmtSubscriber;
+use std::env;
 
 #[tokio::main]
 async fn main() {
@@ -25,37 +26,54 @@ async fn main() {
         .pretty()
         .init();
 
-    info!("Fetching new Sudoku board from API...");
-    
-    match api::fetch_new_board().await {
-        Ok(grid) => {
-            info!("Original board (Difficulty: {}):", grid.difficulty);
-            print_board(&grid.value);
-
-            let mut solver = Solver::new(grid.clone());
-            match solver.solve() {
-                Ok(solution) => {
-                    info!("Our solution:");
-                    print_board(&solution);
-                    
-                    if solver.verify_solution() {
-                        info!("✅ Solution verified against API's solution!");
-                    } else {
-                        error!("❌ Our solution differs from API's solution!");
-                        info!("API's solution:");
-                        print_board(&solver.get_original_solution());
-                    }
-
-                    if solver.has_unique_solution() {
-                        info!("✅ This puzzle has a unique solution!");
-                    } else {
-                        info!("⚠️  This puzzle has multiple valid solutions!");
-                    }
-                }
-                Err(e) => error!("Failed to solve board: {}", e),
+    // Parse command line arguments
+    let args: Vec<String> = env::args().collect();
+    match args.get(1).map(|s| s.as_str()) {
+        Some("benchmark") => {
+            let count = args.get(2)
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(100);
+            
+            info!("Running benchmark with {} boards...", count);
+            match benchmark::run_benchmark(count, true).await {
+                Ok(results) => results.print_results(),
+                Err(e) => error!("Benchmark failed: {}", e),
             }
         }
-        Err(e) => error!("Failed to fetch board: {}", e),
+        _ => {
+            info!("Fetching new Sudoku board from API...");
+            
+            match api::fetch_new_board().await {
+                Ok(grid) => {
+                    info!("Original board (Difficulty: {}):", grid.difficulty);
+                    print_board(&grid.value);
+
+                    let mut solver = Solver::new(grid.clone());
+                    match solver.solve() {
+                        Ok(solution) => {
+                            info!("Our solution:");
+                            print_board(&solution);
+                            
+                            if solver.verify_solution() {
+                                info!("✅ Solution verified against API's solution!");
+                            } else {
+                                error!("❌ Our solution differs from API's solution!");
+                                info!("API's solution:");
+                                print_board(&solver.get_original_solution());
+                            }
+
+                            if solver.has_unique_solution() {
+                                info!("✅ This puzzle has a unique solution!");
+                            } else {
+                                info!("⚠️  This puzzle has multiple valid solutions!");
+                            }
+                        }
+                        Err(e) => error!("Failed to solve board: {}", e),
+                    }
+                }
+                Err(e) => error!("Failed to fetch board: {}", e),
+            }
+        }
     }
 }
 
