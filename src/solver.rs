@@ -1,4 +1,4 @@
-use crate::{Board, CandidateSet, Grid, Result, SudokuError};
+use crate::{Board, CandidateSet, Grid, Result, SudokuError, simd::{SimdValidator, SimdSolver}};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -11,15 +11,25 @@ pub struct Solver {
     candidates: Vec<CandidateSet>,
     // Track if we found a unique solution
     unique_solution: bool,
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    simd_solver: Option<SimdSolver>,
 }
 
 impl Solver {
     pub fn new(grid: Grid) -> Self {
+        let board = Board::new(&grid.value);
+        let solution = Board::new(&grid.solution);
         let mut solver = Self {
-            board: Board::new(&grid.value),
-            solution: Board::new(&grid.solution),
+            board,
+            solution,
             candidates: vec![CandidateSet::empty(); 81],
             unique_solution: true,
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            simd_solver: if has_simd_support() {
+                unsafe { Some(SimdSolver::new(&board)) }
+            } else {
+                None
+            },
         };
         solver.precompute_candidates();
         solver
@@ -61,6 +71,10 @@ impl Solver {
     pub fn solve(&mut self) -> Result<Vec<Vec<i32>>> {
         let empty_cells = self.find_empty_cells();
         if empty_cells.is_empty() {
+            // Use SIMD validation when checking the final solution
+            if !SimdValidator::validate_solution(&self.board) {
+                return Err(SudokuError::InvalidBoard);
+            }
             return Ok(self.board.to_vec());
         }
 
@@ -81,12 +95,13 @@ impl Solver {
             let board = self.board.clone();
             let solution = self.solution.clone();
             
-            // Use atomic flag to stop other threads once a solution is found
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            let simd_solver = self.simd_solver.clone();
+            
             let solution_found = Arc::new(AtomicBool::new(false));
             let multiple_solutions = Arc::new(AtomicBool::new(false));
             let matches_api = Arc::new(AtomicBool::new(false));
             
-            // Use a channel to send the solution back from the parallel iterator
             let (tx, rx) = crossbeam::channel::bounded(1);
             
             candidates.iter_candidates().collect::<Vec<_>>().into_par_iter().find_any(|&num| {
@@ -96,7 +111,13 @@ impl Solver {
                 }
 
                 let mut board_copy = board.clone();
-                if self.try_solve_with_value(row, col, num, &mut board_copy) {
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                let mut simd_solver_copy = simd_solver.clone();
+                
+                if self.try_solve_with_value(row, col, num, &mut board_copy, 
+                    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                    simd_solver_copy.as_mut()
+                ) {
                     debug!("Found solution with {} at ({}, {})", num, row, col);
                     
                     // Check if this solution matches the API's solution
@@ -132,16 +153,47 @@ impl Solver {
         Err(SudokuError::InvalidBoard)
     }
 
-    fn try_solve_with_value(&self, start_row: usize, start_col: usize, value: u8, board: &mut Board) -> bool {
+    fn try_solve_with_value(
+        &self, 
+        start_row: usize, 
+        start_col: usize, 
+        value: u8, 
+        board: &mut Board,
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        simd_solver: Option<&mut SimdSolver>,
+    ) -> bool {
         board.set(start_row, start_col, value);
+        
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if let Some(solver) = simd_solver {
+            unsafe {
+                solver.update_masks(start_row, start_col, value);
+            }
+        }
+        
         trace!("Trying value {} at ({}, {})", value, start_row, start_col);
         
         if let Some((next_row, next_col)) = self.find_next_empty(board) {
             for num in 1..=9 {
-                if self.is_valid_placement(board, next_row, next_col, num) {
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                let is_valid = if let Some(solver) = simd_solver {
+                    unsafe { solver.is_valid_candidate(next_row, next_col, num) }
+                } else {
+                    self.is_valid_placement(board, next_row, next_col, num)
+                };
+                
+                #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+                let is_valid = self.is_valid_placement(board, next_row, next_col, num);
+                
+                if is_valid {
                     let mut new_board = board.clone();
-                    new_board.set(next_row, next_col, num);
-                    if self.try_solve_with_value(next_row, next_col, num, &mut new_board) {
+                    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                    let mut new_simd_solver = simd_solver.cloned();
+                    
+                    if self.try_solve_with_value(next_row, next_col, num, &mut new_board,
+                        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+                        new_simd_solver.as_mut()
+                    ) {
                         *board = new_board;
                         return true;
                     }
@@ -155,47 +207,8 @@ impl Solver {
     }
 
     fn is_valid_solution(&self, board: &Board) -> bool {
-        // Check each row
-        for row in 0..9 {
-            let mut seen = [false; 10];
-            for col in 0..9 {
-                let num = board.get(row, col);
-                if num == 0 || seen[num as usize] {
-                    return false;
-                }
-                seen[num as usize] = true;
-            }
-        }
-
-        // Check each column
-        for col in 0..9 {
-            let mut seen = [false; 10];
-            for row in 0..9 {
-                let num = board.get(row, col);
-                if num == 0 || seen[num as usize] {
-                    return false;
-                }
-                seen[num as usize] = true;
-            }
-        }
-
-        // Check each 3x3 box
-        for box_row in 0..3 {
-            for box_col in 0..3 {
-                let mut seen = [false; 10];
-                for i in 0..3 {
-                    for j in 0..3 {
-                        let num = board.get(box_row * 3 + i, box_col * 3 + j);
-                        if num == 0 || seen[num as usize] {
-                            return false;
-                        }
-                        seen[num as usize] = true;
-                    }
-                }
-            }
-        }
-
-        true
+        // Use SIMD validation for better performance
+        SimdValidator::validate_solution(board)
     }
 
     fn find_next_empty(&self, board: &Board) -> Option<(usize, usize)> {
@@ -420,5 +433,27 @@ mod tests {
         solver.solve().unwrap();
         assert!(solver.has_unique_solution(), "Board with one empty cell should have unique solution");
         assert!(solver.verify_solution(), "Solution should match API's solution");
+    }
+
+    #[test]
+    fn test_simd_solution_validation() {
+        let grid = Grid {
+            value: vec![
+                vec![5,3,4,6,7,8,9,1,2],
+                vec![6,7,2,1,9,5,3,4,8],
+                vec![1,9,8,3,4,2,5,6,7],
+                vec![8,5,9,7,6,1,4,2,3],
+                vec![4,2,6,8,5,3,7,9,1],
+                vec![7,1,3,9,2,4,8,5,6],
+                vec![9,6,1,5,3,7,2,8,4],
+                vec![2,8,7,4,1,9,6,3,5],
+                vec![3,4,5,2,8,6,1,7,9],
+            ],
+            solution: vec![vec![0; 9]; 9],  // Not needed for this test
+            difficulty: "Test".to_string(),
+        };
+
+        let board = Board::new(&grid.value);
+        assert!(SimdValidator::validate_solution(&board));
     }
 } 

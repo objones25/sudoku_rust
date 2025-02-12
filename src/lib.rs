@@ -4,10 +4,11 @@ use thiserror::Error;
 pub mod solver;
 pub mod api;
 pub mod benchmark;
+pub mod simd;
 
 /// A bitset representation of candidate numbers for a Sudoku cell
 #[derive(Debug, Clone, Copy, Default)]
-pub struct CandidateSet(u16);
+pub struct CandidateSet(pub(crate) u16);
 
 impl CandidateSet {
     /// Creates a new CandidateSet with all numbers 1-9 as candidates
@@ -57,9 +58,10 @@ impl CandidateSet {
 }
 
 /// A flat array representation of a Sudoku board
+#[repr(align(16))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Board {
-    cells: [u8; 81],
+    pub(crate) cells: [u8; 81],
 }
 
 impl Board {
