@@ -4,12 +4,13 @@ A high-performance, multi-threaded Sudoku solver implementation in Rust with API
 
 ## Features
 
-- Multi-threaded puzzle solving
+- Multi-threaded puzzle solving with adaptive thread pool
 - Integration with external Sudoku API for puzzle generation
-- Board caching mechanism
+- Efficient board caching mechanism with LRU implementation
 - Comprehensive benchmarking capabilities
 - Support for detecting multiple solutions
-- Rate-limited API requests
+- Rate-limited API requests with exponential backoff
+- Bitset-based candidate tracking for optimal performance
 
 ## Architecture
 
@@ -17,62 +18,72 @@ A high-performance, multi-threaded Sudoku solver implementation in Rust with API
 
 1. **API Integration** (`api.rs`)
    - External puzzle fetching from `https://sudoku-api.vercel.app/api/dosuku`
-   - Implements board caching (cache size: 50 boards)
+   - LRU board caching (cache size: 50 boards)
    - Rate limiting (100ms minimum interval between requests)
+   - Exponential backoff for failed requests
    - Supports batch fetching and prefetching
 
 2. **Solver** (`solver.rs`)
-   - Multi-threaded solving algorithm
-   - Supports detection of multiple solutions
-   - Cell-by-cell solving with candidate tracking
-   - Empty cell optimization
+   - Multi-threaded solving algorithm using Rayon
+   - Bitset-based candidate tracking
+   - Cell selection optimization based on candidate count
+   - Parallel solution space exploration
+   - Multiple solution detection
 
-## Benchmark Results
+3. **Benchmarking** (`benchmark.rs`)
+   - Comprehensive performance metrics
+   - Difficulty distribution analysis
+   - Solution uniqueness tracking
+   - Memory usage monitoring
+
+## Latest Benchmark Results
 
 Recent benchmark results from running 100 puzzles:
 
 ```
-Total Duration: 96.98 seconds
-Average Duration: 633.75 ms
-Min Duration: 203.04 µs
-Max Duration: 13.18 seconds
+Total Duration: 70.11 seconds
+Average Duration: 94.57 ms
+Min Duration: 150.17 µs
+Max Duration: 3.08 seconds
 
 Success Rate:
 - Total Boards: 100
 - Successfully Solved: 100 (100.0%)
-- Unique Solutions: 22 (22.0%)
-- Multiple Solutions: 78 (78.0%)
+- Unique Solutions: 40 (40.0%)
+- Multiple Solutions: 60 (60.0%)
 
 Difficulty Distribution:
-- Easy: 8 (8.0%)
-- Medium: 52 (52.0%)
-- Hard: 40 (40.0%)
+- Easy: 2 (2.0%)
+- Medium: 70 (70.0%)
+- Hard: 28 (28.0%)
 ```
 
 ### Performance Analysis
 
 - The solver achieves a 100% success rate across all difficulty levels
-- 78% of puzzles had multiple valid solutions, indicating they might not be well-constrained
-- Significant variance in solving time (203µs to 13.18s) suggests complexity-dependent performance
-- Average solving time of 633.75ms is reasonable for complex puzzles
+- 60% of puzzles had multiple valid solutions, indicating potential for constraint improvement
+- Significant variance in solving time (150µs to 3.08s) shows complexity-dependent performance
+- Average solving time of 94.57ms demonstrates excellent performance for complex puzzles
 
 ## Implementation Details
 
-### API Rate Limiting
-- Minimum 100ms interval between requests
-- Implements board caching to reduce API load
-- Supports prefetching to optimize performance
+### Memory Optimization
+- Bitset-based candidate tracking (u16 per cell)
+- Efficient board representation using fixed-size arrays
+- Memory-efficient caching with LRU policy
+- Zero-copy board state management
 
-### Solver Characteristics
-- Multi-threaded implementation for parallel solution exploration
-- Early detection of multiple solutions
-- Optimization for empty cell count (ranges from 41 to 64 cells observed)
-- Candidate tracking for efficient solution space exploration
+### Parallel Processing
+- Work stealing thread pool via Rayon
+- Adaptive parallelization based on puzzle complexity
+- Thread-safe caching mechanism
+- Efficient parallel solution space exploration
 
-### Logging and Debugging
-- Comprehensive debug logging
-- Tracks solving progress and solution discovery
-- Thread-aware logging for parallel execution analysis
+### API Integration
+- Robust error handling with exponential backoff
+- Rate limiting to prevent API abuse
+- Efficient board caching to reduce API calls
+- Batch request support for multiple puzzles
 
 ## Usage
 
@@ -81,12 +92,14 @@ Difficulty Distribution:
 ## Performance Optimization Tips
 
 1. **Board Caching**
-   - Utilize the built-in board cache for repeated operations
+   - Utilize the LRU cache for repeated operations
    - Consider prefetching boards for batch operations
+   - Monitor cache hit rates for optimal sizing
 
 2. **Parallel Processing**
-   - The solver automatically utilizes multiple threads
+   - The solver automatically utilizes available CPU cores
    - Best performance on multi-core systems
+   - Consider CPU affinity settings for optimal performance
 
 3. **API Usage**
    - Respect rate limiting (100ms between requests)
@@ -96,72 +109,20 @@ Difficulty Distribution:
 ## Future Improvements
 
 1. **Solution Quality**
-   - Implement stricter puzzle validation
-   - Reduce the percentage of multiple-solution puzzles
-   - Add difficulty validation
+   - Implement advanced solving techniques (Hidden Singles, Naked Pairs)
+   - Add constraint validation for puzzle generation
+   - Improve multiple solution detection efficiency
 
 2. **Performance**
-   - Optimize worst-case solving time
-   - Implement smarter candidate selection
-   - Add solving strategy heuristics
+   - Implement SIMD operations for candidate management
+   - Add GPU acceleration for batch solving
+   - Optimize memory allocation patterns
 
-3. **API Integration**
-   - Add support for multiple puzzle sources
-   - Implement failover mechanisms
-   - Enhance caching strategies
-
-## Implementation Plan
-
-### Phase 1: Bitset Optimization
-
-#### Current Implementation
-```rust
-// Current: Vector-based candidate tracking
-Vec<Vec<i32>> // O(n) memory per cell
-```
-
-#### Proposed Implementation
-```rust
-// Proposed: Bitset-based candidate tracking
-type CandidateSet = u16; // O(1) memory per cell
-const CANDIDATE_1: u16 = 1 << 0;
-const CANDIDATE_9: u16 = 1 << 8;
-```
-
-#### Expected Benefits
-- Memory reduction: ~80% less memory per cell
-- Performance improvement: 2-4x faster candidate operations
-- Better cache utilization
-- More consistent performance across different puzzle complexities
-
-#### Implementation Steps
-1. Create a new `CandidateSet` type using `u16`
-2. Implement bitwise operations for candidate management:
-   ```rust
-   impl CandidateSet {
-       fn add_candidate(&mut self, n: u8) { *self |= 1 << (n-1); }
-       fn remove_candidate(&mut self, n: u8) { *self &= !(1 << (n-1)); }
-       fn has_candidate(&self, n: u8) -> bool { (*self & (1 << (n-1))) != 0 }
-       fn count_candidates(&self) -> u32 { self.count_ones() }
-   }
-   ```
-3. Update the solver to use bitset operations
-4. Add unit tests for bitset operations
-5. Benchmark and compare with current implementation
-
-#### Success Metrics
-- Reduced memory usage (target: 60-80% reduction)
-- Faster candidate operations (target: 2-4x improvement)
-- More consistent solving times across different puzzles
-- Reduced worst-case solving time
-
-#### Risks and Mitigations
-- Risk: More complex code
-  - Mitigation: Comprehensive documentation and unit tests
-- Risk: Platform-specific performance
-  - Mitigation: Cross-platform benchmarking
-- Risk: Integration challenges
-  - Mitigation: Phased rollout with feature flags
+3. **Features**
+   - Add puzzle generation capabilities
+   - Implement difficulty rating system
+   - Add solution visualization
+   - Support for additional puzzle formats
 
 ## License
 
