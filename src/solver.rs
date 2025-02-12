@@ -1,14 +1,14 @@
-use crate::{Grid, Result, SudokuError};
+use crate::{Board, CandidateSet, Grid, Result, SudokuError};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::{debug, trace};
 
 pub struct Solver {
-    board: Vec<Vec<i32>>,
-    solution: Vec<Vec<i32>>,
+    board: Board,
+    solution: Board,
     // Pre-computed candidates for each cell
-    candidates: Vec<Vec<Vec<i32>>>,
+    candidates: Vec<CandidateSet>,
     // Track if we found a unique solution
     unique_solution: bool,
 }
@@ -16,9 +16,9 @@ pub struct Solver {
 impl Solver {
     pub fn new(grid: Grid) -> Self {
         let mut solver = Self {
-            board: grid.value,
-            solution: grid.solution,
-            candidates: vec![vec![vec![]; 9]; 9],
+            board: Board::new(&grid.value),
+            solution: Board::new(&grid.solution),
+            candidates: vec![CandidateSet::empty(); 81],
             unique_solution: true,
         };
         solver.precompute_candidates();
@@ -29,14 +29,15 @@ impl Solver {
     fn precompute_candidates(&mut self) {
         for row in 0..9 {
             for col in 0..9 {
-                if self.board[row][col] == 0 {
-                    let mut valid_nums = Vec::new();
+                if self.board.is_empty_cell(row, col) {
+                    let mut candidates = CandidateSet::all();
+                    // Remove candidates that are already present in the same row, column, or box
                     for num in 1..=9 {
-                        if self.is_valid_placement(&self.board, row, col, num) {
-                            valid_nums.push(num);
+                        if !self.is_valid_placement(&self.board, row, col, num) {
+                            candidates.remove_candidate(num);
                         }
                     }
-                    self.candidates[row][col] = valid_nums;
+                    self.candidates[row * 9 + col] = candidates;
                 }
             }
         }
@@ -47,20 +48,20 @@ impl Solver {
         let mut cells = Vec::new();
         for row in 0..9 {
             for col in 0..9 {
-                if self.board[row][col] == 0 {
+                if self.board.is_empty_cell(row, col) {
                     cells.push((row, col));
                 }
             }
         }
         // Sort by number of candidates (ascending)
-        cells.sort_by_key(|&(row, col)| self.candidates[row][col].len());
+        cells.sort_by_key(|&(row, col)| self.candidates[row * 9 + col].count_candidates());
         cells
     }
 
     pub fn solve(&mut self) -> Result<Vec<Vec<i32>>> {
         let empty_cells = self.find_empty_cells();
         if empty_cells.is_empty() {
-            return Ok(self.board.clone());
+            return Ok(self.board.to_vec());
         }
 
         debug!("Found {} empty cells", empty_cells.len());
@@ -68,9 +69,10 @@ impl Solver {
         // Try each empty cell until we find a solution
         for (idx, &(row, col)) in empty_cells.iter().enumerate() {
             debug!("Trying cell {}/{} at ({}, {}) with {} candidates", 
-                  idx + 1, empty_cells.len(), row, col, self.candidates[row][col].len());
+                  idx + 1, empty_cells.len(), row, col, 
+                  self.candidates[row * 9 + col].count_candidates());
             
-            let candidates = self.candidates[row][col].clone();
+            let candidates = self.candidates[row * 9 + col];
             if candidates.is_empty() {
                 debug!("No candidates available for ({}, {})", row, col);
                 continue;
@@ -87,7 +89,7 @@ impl Solver {
             // Use a channel to send the solution back from the parallel iterator
             let (tx, rx) = crossbeam::channel::bounded(1);
             
-            candidates.into_par_iter().find_any(|&num| {
+            candidates.iter_candidates().collect::<Vec<_>>().into_par_iter().find_any(|&num| {
                 trace!("Trying candidate {} at ({}, {})", num, row, col);
                 if solution_found.load(Ordering::Relaxed) {
                     return false;
@@ -120,7 +122,7 @@ impl Solver {
                 if let Ok(solved_board) = rx.try_recv() {
                     debug!("Successfully received solved board");
                     self.board = solved_board;
-                    return Ok(self.board.clone());
+                    return Ok(self.board.to_vec());
                 }
             }
             debug!("No solution found with current cell, trying next");
@@ -130,15 +132,15 @@ impl Solver {
         Err(SudokuError::InvalidBoard)
     }
 
-    fn try_solve_with_value(&self, start_row: usize, start_col: usize, value: i32, board: &mut Vec<Vec<i32>>) -> bool {
-        board[start_row][start_col] = value;
+    fn try_solve_with_value(&self, start_row: usize, start_col: usize, value: u8, board: &mut Board) -> bool {
+        board.set(start_row, start_col, value);
         trace!("Trying value {} at ({}, {})", value, start_row, start_col);
         
         if let Some((next_row, next_col)) = self.find_next_empty(board) {
             for num in 1..=9 {
                 if self.is_valid_placement(board, next_row, next_col, num) {
                     let mut new_board = board.clone();
-                    new_board[next_row][next_col] = num;
+                    new_board.set(next_row, next_col, num);
                     if self.try_solve_with_value(next_row, next_col, num, &mut new_board) {
                         *board = new_board;
                         return true;
@@ -152,11 +154,12 @@ impl Solver {
         }
     }
 
-    fn is_valid_solution(&self, board: &[Vec<i32>]) -> bool {
+    fn is_valid_solution(&self, board: &Board) -> bool {
         // Check each row
         for row in 0..9 {
             let mut seen = [false; 10];
-            for &num in &board[row] {
+            for col in 0..9 {
+                let num = board.get(row, col);
                 if num == 0 || seen[num as usize] {
                     return false;
                 }
@@ -168,7 +171,7 @@ impl Solver {
         for col in 0..9 {
             let mut seen = [false; 10];
             for row in 0..9 {
-                let num = board[row][col];
+                let num = board.get(row, col);
                 if num == 0 || seen[num as usize] {
                     return false;
                 }
@@ -182,7 +185,7 @@ impl Solver {
                 let mut seen = [false; 10];
                 for i in 0..3 {
                     for j in 0..3 {
-                        let num = board[box_row * 3 + i][box_col * 3 + j];
+                        let num = board.get(box_row * 3 + i, box_col * 3 + j);
                         if num == 0 || seen[num as usize] {
                             return false;
                         }
@@ -195,10 +198,10 @@ impl Solver {
         true
     }
 
-    fn find_next_empty(&self, board: &[Vec<i32>]) -> Option<(usize, usize)> {
+    fn find_next_empty(&self, board: &Board) -> Option<(usize, usize)> {
         for row in 0..9 {
             for col in 0..9 {
-                if board[row][col] == 0 {
+                if board.is_empty_cell(row, col) {
                     return Some((row, col));
                 }
             }
@@ -206,15 +209,19 @@ impl Solver {
         None
     }
 
-    fn is_valid_placement(&self, board: &[Vec<i32>], row: usize, col: usize, num: i32) -> bool {
+    fn is_valid_placement(&self, board: &Board, row: usize, col: usize, num: u8) -> bool {
         // Check row
-        if board[row].contains(&num) {
-            return false;
+        for j in 0..9 {
+            if board.get(row, j) == num {
+                return false;
+            }
         }
 
         // Check column
-        if (0..9).any(|i| board[i][col] == num) {
-            return false;
+        for i in 0..9 {
+            if board.get(i, col) == num {
+                return false;
+            }
         }
 
         // Check 3x3 box
@@ -222,7 +229,7 @@ impl Solver {
         let box_col = (col / 3) * 3;
         for i in 0..3 {
             for j in 0..3 {
-                if board[box_row + i][box_col + j] == num {
+                if board.get(box_row + i, box_col + j) == num {
                     return false;
                 }
             }
@@ -240,11 +247,11 @@ impl Solver {
     }
 
     pub fn get_solution(&self) -> Vec<Vec<i32>> {
-        self.board.clone()
+        self.board.to_vec()
     }
 
     pub fn get_original_solution(&self) -> Vec<Vec<i32>> {
-        self.solution.clone()
+        self.solution.to_vec()
     }
 }
 
@@ -374,7 +381,7 @@ mod tests {
         let solution = solver.solve().unwrap();
         
         // Verify that we found a valid solution
-        assert!(solver.is_valid_solution(&solution));
+        assert!(solver.is_valid_solution(&Board::new(&solution)));
         
         // Note: The solution might not match the API's solution since an empty board
         // has multiple valid solutions
