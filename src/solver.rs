@@ -1,8 +1,8 @@
-use crate::{Board, CandidateSet, Grid, Result, SudokuError, simd::{SimdValidator, SimdSolver}};
+use crate::{Board, CandidateSet, Grid, Result, SudokuError, simd::{SimdValidator, SimdSolver, has_simd_support}};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tracing::{debug, trace};
+use std::time::Duration;
 
 pub struct Solver {
     board: Board,
@@ -11,7 +11,7 @@ pub struct Solver {
     candidates: Vec<CandidateSet>,
     // Track if we found a unique solution
     unique_solution: bool,
-    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
     simd_solver: Option<SimdSolver>,
 }
 
@@ -20,11 +20,11 @@ impl Solver {
         let board = Board::new(&grid.value);
         let solution = Board::new(&grid.solution);
         let mut solver = Self {
-            board,
+            board: board.clone(),
             solution,
             candidates: vec![CandidateSet::empty(); 81],
             unique_solution: true,
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
             simd_solver: if has_simd_support() {
                 unsafe { Some(SimdSolver::new(&board)) }
             } else {
@@ -53,103 +53,175 @@ impl Solver {
         }
     }
 
-    /// Find all empty cells sorted by number of candidates
+    /// Find all empty cells sorted by number of candidates and constraint impact
     fn find_empty_cells(&self) -> Vec<(usize, usize)> {
         let mut cells = Vec::new();
+        let mut min_candidates = 10;
+        let mut max_impact = 0;
+        
+        // First pass: find minimum number of candidates and maximum impact
         for row in 0..9 {
             for col in 0..9 {
                 if self.board.is_empty_cell(row, col) {
-                    cells.push((row, col));
+                    let count = self.candidates[row * 9 + col].count_candidates();
+                    if count < min_candidates {
+                        min_candidates = count;
+                        max_impact = self.calculate_impact(row, col);
+                    } else if count == min_candidates {
+                        let impact = self.calculate_impact(row, col);
+                        max_impact = max_impact.max(impact);
+                    }
                 }
             }
         }
-        // Sort by number of candidates (ascending)
-        cells.sort_by_key(|&(row, col)| self.candidates[row * 9 + col].count_candidates());
+        
+        // Second pass: collect cells with minimum candidates and maximum impact
+        for row in 0..9 {
+            for col in 0..9 {
+                if self.board.is_empty_cell(row, col) {
+                    let count = self.candidates[row * 9 + col].count_candidates();
+                    let impact = self.calculate_impact(row, col);
+                    if count == min_candidates && impact >= max_impact {
+                        cells.push((row, col));
+                    }
+                }
+            }
+        }
+        
+        // If no cells found, collect all empty cells
+        if cells.is_empty() {
+            for row in 0..9 {
+                for col in 0..9 {
+                    if self.board.is_empty_cell(row, col) {
+                        cells.push((row, col));
+                    }
+                }
+            }
+        }
+        
         cells
+    }
+
+    /// Calculate the impact of filling a cell based on constraints
+    fn calculate_impact(&self, row: usize, col: usize) -> u32 {
+        let mut impact = 0;
+        let candidates = self.candidates[row * 9 + col];
+        
+        // Check row impact
+        for j in 0..9 {
+            if j != col && self.board.is_empty_cell(row, j) {
+                let other_candidates = self.candidates[row * 9 + j];
+                impact += (candidates.0 & other_candidates.0).count_ones();
+            }
+        }
+        
+        // Check column impact
+        for i in 0..9 {
+            if i != row && self.board.is_empty_cell(i, col) {
+                let other_candidates = self.candidates[i * 9 + col];
+                impact += (candidates.0 & other_candidates.0).count_ones();
+            }
+        }
+        
+        // Check box impact
+        let box_row = (row / 3) * 3;
+        let box_col = (col / 3) * 3;
+        for i in 0..3 {
+            for j in 0..3 {
+                let r = box_row + i;
+                let c = box_col + j;
+                if (r != row || c != col) && self.board.is_empty_cell(r, c) {
+                    let other_candidates = self.candidates[r * 9 + c];
+                    impact += (candidates.0 & other_candidates.0).count_ones();
+                }
+            }
+        }
+        
+        impact
     }
 
     pub fn solve(&mut self) -> Result<Vec<Vec<i32>>> {
         let empty_cells = self.find_empty_cells();
         if empty_cells.is_empty() {
-            // Use SIMD validation when checking the final solution
             if !SimdValidator::validate_solution(&self.board) {
                 return Err(SudokuError::InvalidBoard);
             }
             return Ok(self.board.to_vec());
         }
-
-        debug!("Found {} empty cells", empty_cells.len());
         
-        // Try each empty cell until we find a solution
-        for (idx, &(row, col)) in empty_cells.iter().enumerate() {
-            debug!("Trying cell {}/{} at ({}, {}) with {} candidates", 
-                  idx + 1, empty_cells.len(), row, col, 
-                  self.candidates[row * 9 + col].count_candidates());
-            
-            let candidates = self.candidates[row * 9 + col];
-            if candidates.is_empty() {
-                debug!("No candidates available for ({}, {})", row, col);
-                continue;
-            }
+        // Take only the first empty cell with minimum candidates and maximum impact
+        let (row, col) = empty_cells[0];
+        let candidates = self.candidates[row * 9 + col];
+        
+        if candidates.is_empty() {
+            return Err(SudokuError::InvalidBoard);
+        }
 
-            let board = self.board.clone();
-            let solution = self.solution.clone();
-            
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-            let simd_solver = self.simd_solver.clone();
-            
-            let solution_found = Arc::new(AtomicBool::new(false));
-            let multiple_solutions = Arc::new(AtomicBool::new(false));
-            let matches_api = Arc::new(AtomicBool::new(false));
-            
-            let (tx, rx) = crossbeam::channel::bounded(1);
-            
-            candidates.iter_candidates().collect::<Vec<_>>().into_par_iter().find_any(|&num| {
-                trace!("Trying candidate {} at ({}, {})", num, row, col);
-                if solution_found.load(Ordering::Relaxed) {
-                    return false;
+        let board = self.board.clone();
+        let solution = self.solution.clone();
+        
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+        let simd_solver = self.simd_solver.clone();
+        
+        let solution_found = Arc::new(AtomicBool::new(false));
+        let matches_api = Arc::new(AtomicBool::new(false));
+        
+        // Use bounded channel with a reasonable size
+        let (tx, rx) = crossbeam::channel::bounded(1);
+        
+        // Sort candidates by their impact for better pruning
+        let mut sorted_candidates: Vec<_> = candidates.iter_candidates().collect();
+        sorted_candidates.sort_by_key(|&num| {
+            let mut board_copy = board.clone();
+            board_copy.set(row, col, num);
+            self.calculate_impact(row, col)
+        });
+
+        sorted_candidates.into_par_iter()
+            .find_map_first(|num| {
+                if solution_found.load(Ordering::SeqCst) {
+                    return None;
                 }
 
                 let mut board_copy = board.clone();
-                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-                let mut simd_solver_copy = simd_solver.clone();
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+                let simd_solver = simd_solver.clone();
                 
                 if self.try_solve_with_value(row, col, num, &mut board_copy, 
-                    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-                    simd_solver_copy.as_mut()
+                    #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+                    simd_solver
                 ) {
-                    debug!("Found solution with {} at ({}, {})", num, row, col);
-                    
-                    // Check if this solution matches the API's solution
                     if board_copy == solution {
-                        matches_api.store(true, Ordering::Relaxed);
+                        matches_api.store(true, Ordering::SeqCst);
                     }
                     
-                    // If we already found a solution, this means we have multiple solutions
-                    if solution_found.fetch_or(true, Ordering::Relaxed) {
-                        debug!("Found multiple solutions");
-                        multiple_solutions.store(true, Ordering::Relaxed);
-                        return false;
+                    if solution_found.fetch_or(true, Ordering::SeqCst) {
+                        return None;
                     }
-                    let _ = tx.send(board_copy);
-                    return true;
+                    
+                    match tx.send_timeout(board_copy, Duration::from_secs(1)) {
+                        Ok(_) => Some(()),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
                 }
-                false
             });
 
-            self.unique_solution = matches_api.load(Ordering::Relaxed);
-            
-            if solution_found.load(Ordering::Relaxed) {
-                if let Ok(solved_board) = rx.try_recv() {
-                    debug!("Successfully received solved board");
+        self.unique_solution = matches_api.load(Ordering::SeqCst);
+        
+        if solution_found.load(Ordering::SeqCst) {
+            match rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(solved_board) => {
                     self.board = solved_board;
                     return Ok(self.board.to_vec());
                 }
+                Err(_) => {
+                    return Err(SudokuError::InvalidBoard);
+                }
             }
-            debug!("No solution found with current cell, trying next");
         }
 
-        debug!("No solution found with any cell");
         Err(SudokuError::InvalidBoard)
     }
 
@@ -159,40 +231,39 @@ impl Solver {
         start_col: usize, 
         value: u8, 
         board: &mut Board,
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        simd_solver: Option<&mut SimdSolver>,
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+        mut simd_solver: Option<SimdSolver>,
     ) -> bool {
         board.set(start_row, start_col, value);
         
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        if let Some(solver) = simd_solver {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+        if let Some(ref mut solver) = simd_solver {
             unsafe {
                 solver.update_masks(start_row, start_col, value);
             }
         }
         
-        trace!("Trying value {} at ({}, {})", value, start_row, start_col);
         
         if let Some((next_row, next_col)) = self.find_next_empty(board) {
             for num in 1..=9 {
-                #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-                let is_valid = if let Some(solver) = simd_solver {
+                #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+                let is_valid = if let Some(ref solver) = simd_solver {
                     unsafe { solver.is_valid_candidate(next_row, next_col, num) }
                 } else {
                     self.is_valid_placement(board, next_row, next_col, num)
                 };
                 
-                #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+                #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
                 let is_valid = self.is_valid_placement(board, next_row, next_col, num);
                 
                 if is_valid {
                     let mut new_board = board.clone();
-                    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-                    let mut new_simd_solver = simd_solver.cloned();
+                    #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+                    let new_simd_solver = simd_solver.clone();
                     
                     if self.try_solve_with_value(next_row, next_col, num, &mut new_board,
-                        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-                        new_simd_solver.as_mut()
+                        #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
+                        new_simd_solver
                     ) {
                         *board = new_board;
                         return true;

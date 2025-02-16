@@ -1,67 +1,129 @@
-use crate::{ApiResponse, Grid, Result};
+use crate::{ApiResponse, Grid, Result, SudokuError, generator::BoardGenerator};
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::{debug, warn};
 use once_cell::sync::Lazy;
+use reqwest::Client;
 
 const API_URL: &str = "https://sudoku-api.vercel.app/api/dosuku";
-const CACHE_SIZE: usize = 50;
+const CACHE_SIZE: usize = 1000; // Increased cache size
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_RETRIES: u32 = 3;
+const LOCAL_GENERATION_THRESHOLD: usize = 100; // Number of boards to generate locally at startup
 
-static BOARD_CACHE: Lazy<Mutex<VecDeque<Grid>>> = Lazy::new(|| Mutex::new(VecDeque::with_capacity(CACHE_SIZE)));
+// Use parking_lot::Mutex for better deadlock handling
+static BOARD_CACHE: Lazy<Mutex<VecDeque<Grid>>> = Lazy::new(|| {
+    let cache = VecDeque::with_capacity(CACHE_SIZE);
+    Mutex::new(cache)
+});
+
 static LAST_REQUEST: Lazy<Mutex<Instant>> = Lazy::new(|| Mutex::new(Instant::now()));
+static BOARD_GENERATOR: Lazy<Mutex<BoardGenerator>> = Lazy::new(|| Mutex::new(BoardGenerator::new()));
 
-/// Fetches a new Sudoku board from the API or cache.
-/// Uses a local cache to store recently fetched boards and implements rate limiting.
+// Create a reusable HTTP client with connection pooling
+static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
+    Client::builder()
+        .pool_max_idle_per_host(10)
+        .pool_idle_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(5))
+        .build()
+        .expect("Failed to create HTTP client")
+});
+
+// Initialize cache in a separate function to avoid deadlocks during static initialization
+fn initialize_cache() {
+    let mut generator = BOARD_GENERATOR.lock();
+    let mut cache = BOARD_CACHE.lock();
+    
+    if cache.is_empty() {
+        for _ in 0..LOCAL_GENERATION_THRESHOLD {
+            if let Ok(board) = generator.generate() {
+                cache.push_back(board);
+            }
+        }
+    }
+}
+
+/// Fetches a new Sudoku board from the cache, API, or generates one locally.
 pub async fn fetch_new_board() -> Result<Grid> {
+    // Initialize cache if needed
+    initialize_cache();
+
     // Try to get a board from cache first
     if let Some(board) = get_from_cache() {
         debug!("Retrieved board from cache");
         return Ok(board);
     }
 
-    // Rate limiting
+    // Rate limiting with timeout
     let now = Instant::now();
-    let mut last_request = LAST_REQUEST.lock().unwrap();
+    let mut last_request = match LAST_REQUEST.try_lock_for(Duration::from_secs(1)) {
+        Some(lock) => lock,
+        None => {
+            debug!("Rate limiter lock timeout, proceeding with local generation");
+            return generate_local_board();
+        }
+    };
+    
     let elapsed = now.duration_since(*last_request);
     if elapsed < MIN_REQUEST_INTERVAL {
-        sleep(MIN_REQUEST_INTERVAL - elapsed).await;
+        let wait_time = MIN_REQUEST_INTERVAL - elapsed;
+        drop(last_request); // Release lock before sleep
+        sleep(wait_time).await;
+        last_request = match LAST_REQUEST.try_lock_for(Duration::from_secs(1)) {
+            Some(lock) => lock,
+            None => {
+                debug!("Rate limiter lock timeout after wait, proceeding with local generation");
+                return generate_local_board();
+            }
+        };
     }
     *last_request = Instant::now();
+    drop(last_request);
 
-    // Fetch from API with retries
-    let mut last_error: Option<Box<dyn std::error::Error + Send + Sync>> = None;
-    for retry in 0..MAX_RETRIES {
-        if retry > 0 {
-            sleep(Duration::from_millis(100 * 2u64.pow(retry))).await; // Exponential backoff
-        }
-        
-        match reqwest::get(API_URL).await {
-            Ok(response) => {
-                match response.json::<ApiResponse>().await {
-                    Ok(api_response) => {
-                        if let Some(board) = api_response.newboard.grids.into_iter().next() {
-                            add_to_cache(board.clone());
-                            return Ok(board);
-                        }
-                    }
-                    Err(e) => last_error = Some(Box::new(e)),
-                }
+    // Try API first, then fallback to local generation
+    match fetch_from_api().await {
+        Ok(board) => {
+            if let Err(_) = add_to_cache_with_timeout(board.clone()) {
+                debug!("Cache update timeout, continuing without caching");
             }
-            Err(e) => last_error = Some(Box::new(e)),
+            Ok(board)
+        }
+        Err(e) => {
+            debug!("API error ({}), falling back to local generation", e);
+            generate_local_board()
         }
     }
+}
 
-    // If all retries failed, return a default board
-    warn!("All API retries failed: {:?}", last_error);
-    Ok(Grid {
-        value: vec![vec![0; 9]; 9],
-        solution: vec![vec![0; 9]; 9],
-        difficulty: "Unknown".to_string(),
-    })
+async fn fetch_from_api() -> Result<Grid> {
+    for retry in 0..MAX_RETRIES {
+        if retry > 0 {
+            sleep(Duration::from_millis(100 * 2u64.pow(retry))).await;
+        }
+        
+        match HTTP_CLIENT.get(API_URL).send().await {
+            Ok(response) => {
+                if let Ok(api_response) = response.json::<ApiResponse>().await {
+                    if let Some(board) = api_response.newboard.grids.into_iter().next() {
+                        return Ok(board);
+                    }
+                }
+            }
+            Err(e) => warn!("API request failed: {}", e),
+        }
+    }
+    
+    Err("API requests exhausted".into())
+}
+
+fn generate_local_board() -> Result<Grid> {
+    match BOARD_GENERATOR.try_lock_for(Duration::from_secs(1)) {
+        Some(mut generator) => generator.generate(),
+        None => Err(SudokuError::GeneratorTimeout),
+    }
 }
 
 /// Prefetches multiple boards in the background to fill the cache
@@ -69,21 +131,34 @@ pub async fn prefetch_boards(count: usize) -> Result<()> {
     debug!("Prefetching {} boards", count);
     let mut successful_fetches = 0;
     let mut attempts = 0;
-    let max_attempts = count * 2; // Allow up to double the attempts to handle failures
+    let max_attempts = count * 2;
     
     while successful_fetches < count && attempts < max_attempts {
-        if let Ok(board) = fetch_new_board().await {
+        let board = if attempts % 2 == 0 {
+            // Alternate between API and local generation
+            match fetch_from_api().await {
+                Ok(board) => Ok(board),
+                Err(_) => generate_local_board(),
+            }
+        } else {
+            generate_local_board()
+        };
+
+        if let Ok(board) = board {
             add_to_cache(board);
             successful_fetches += 1;
         }
         attempts += 1;
-        sleep(MIN_REQUEST_INTERVAL).await;
+        
+        if attempts % 2 == 0 {
+            sleep(MIN_REQUEST_INTERVAL).await;
+        }
     }
     
     Ok(())
 }
 
-/// Fetches multiple boards in parallel, respecting rate limits
+/// Fetches multiple boards, using a mix of cached, API, and locally generated boards
 pub async fn fetch_multiple_boards(count: usize) -> Result<Vec<Grid>> {
     let mut boards = Vec::with_capacity(count);
     
@@ -95,32 +170,58 @@ pub async fn fetch_multiple_boards(count: usize) -> Result<Vec<Grid>> {
         }
     }
 
-    // Fetch remaining boards from API with rate limiting
+    // Generate remaining boards using a mix of API and local generation
     let remaining = count - boards.len();
     let mut attempts = 0;
-    let max_attempts = remaining * 2; // Allow up to double the attempts to handle failures
+    let max_attempts = remaining * 2;
     
     while boards.len() < count && attempts < max_attempts {
-        if let Ok(board) = fetch_new_board().await {
+        let board = if attempts % 2 == 0 {
+            match fetch_from_api().await {
+                Ok(board) => Ok(board),
+                Err(_) => generate_local_board(),
+            }
+        } else {
+            generate_local_board()
+        };
+
+        if let Ok(board) = board {
             boards.push(board);
         }
         attempts += 1;
-        sleep(MIN_REQUEST_INTERVAL).await;
+        
+        if attempts % 2 == 0 {
+            sleep(MIN_REQUEST_INTERVAL).await;
+        }
     }
 
     Ok(boards)
 }
 
 fn get_from_cache() -> Option<Grid> {
-    BOARD_CACHE.lock().unwrap().pop_front()
+    BOARD_CACHE.try_lock_for(Duration::from_secs(1))
+        .and_then(|mut cache| cache.pop_front())
 }
 
 fn add_to_cache(board: Grid) {
-    let mut cache = BOARD_CACHE.lock().unwrap();
+    let mut cache = BOARD_CACHE.lock();
     if cache.len() >= CACHE_SIZE {
         cache.pop_back();
     }
     cache.push_front(board);
+}
+
+fn add_to_cache_with_timeout(board: Grid) -> Result<()> {
+    match BOARD_CACHE.try_lock_for(Duration::from_secs(1)) {
+        Some(mut cache) => {
+            if cache.len() >= CACHE_SIZE {
+                cache.pop_back();
+            }
+            cache.push_front(board);
+            Ok(())
+        }
+        None => Err(SudokuError::CacheTimeout),
+    }
 }
 
 #[cfg(test)]
@@ -159,11 +260,40 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache() {
-        // Create a test board
+        // Initialize cache
+        initialize_cache();
+        
+        // Clear the cache first
+        {
+            let mut cache = BOARD_CACHE.lock();
+            cache.clear();
+        }
+        
+        // Create a test board with a valid Sudoku puzzle
         let test_board = Grid {
-            value: vec![vec![1; 9]; 9],
-            solution: vec![vec![1; 9]; 9],
-            difficulty: "Test".to_string(),
+            value: vec![
+                vec![5,3,0,0,7,0,0,0,0],
+                vec![6,0,0,1,9,5,0,0,0],
+                vec![0,9,8,0,0,0,0,6,0],
+                vec![8,0,0,0,6,0,0,0,3],
+                vec![4,0,0,8,0,3,0,0,1],
+                vec![7,0,0,0,2,0,0,0,6],
+                vec![0,6,0,0,0,0,2,8,0],
+                vec![0,0,0,4,1,9,0,0,5],
+                vec![0,0,0,0,8,0,0,7,9],
+            ],
+            solution: vec![
+                vec![5,3,4,6,7,8,9,1,2],
+                vec![6,7,2,1,9,5,3,4,8],
+                vec![1,9,8,3,4,2,5,6,7],
+                vec![8,5,9,7,6,1,4,2,3],
+                vec![4,2,6,8,5,3,7,9,1],
+                vec![7,1,3,9,2,4,8,5,6],
+                vec![9,6,1,5,3,7,2,8,4],
+                vec![2,8,7,4,1,9,6,3,5],
+                vec![3,4,5,2,8,6,1,7,9],
+            ],
+            difficulty: "Medium".to_string(),
         };
         
         // Add to cache
@@ -173,6 +303,7 @@ mod tests {
         let cached_board = get_from_cache().expect("Failed to retrieve from cache");
         assert_eq!(cached_board.value, test_board.value);
         assert_eq!(cached_board.solution, test_board.solution);
+        assert_eq!(cached_board.difficulty, test_board.difficulty);
     }
 
     #[tokio::test]

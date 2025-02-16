@@ -1,10 +1,11 @@
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
+use std::fmt;
 
 pub mod solver;
 pub mod api;
 pub mod benchmark;
 pub mod simd;
+pub mod generator;
 
 /// A bitset representation of candidate numbers for a Sudoku cell
 #[derive(Debug, Clone, Copy, Default)]
@@ -122,23 +123,50 @@ impl Board {
     }
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub enum SudokuError {
-    #[error("Invalid board state")]
+    ApiError(String),
     InvalidBoard,
-    #[error("API error: {0}")]
-    ApiError(#[from] reqwest::Error),
-    #[error("Invalid value at position ({row}, {col}): {value}")]
     InvalidValue {
         row: usize,
         col: usize,
         value: i32,
     },
-    #[error("Benchmark error: {0}")]
     BenchmarkError(String),
+    CacheTimeout,
+    GeneratorTimeout,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl std::error::Error for SudokuError {}
+
+impl fmt::Display for SudokuError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SudokuError::ApiError(msg) => write!(f, "API error: {}", msg),
+            SudokuError::InvalidBoard => write!(f, "Invalid Sudoku board"),
+            SudokuError::InvalidValue { row, col, value } => {
+                write!(f, "Invalid value {} at position ({}, {})", value, row, col)
+            }
+            SudokuError::BenchmarkError(msg) => write!(f, "Benchmark error: {}", msg),
+            SudokuError::CacheTimeout => write!(f, "Cache lock timeout"),
+            SudokuError::GeneratorTimeout => write!(f, "Generator lock timeout"),
+        }
+    }
+}
+
+impl From<reqwest::Error> for SudokuError {
+    fn from(err: reqwest::Error) -> Self {
+        SudokuError::ApiError(err.to_string())
+    }
+}
+
+impl From<&str> for SudokuError {
+    fn from(err: &str) -> Self {
+        SudokuError::ApiError(err.to_string())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Grid {
     pub value: Vec<Vec<i32>>,
     pub solution: Vec<Vec<i32>>,

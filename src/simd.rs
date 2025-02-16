@@ -1,6 +1,9 @@
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use std::arch::x86_64::*;
 
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
+
 use crate::{Board, CandidateSet};
 
 /// Feature detection for SIMD support
@@ -10,7 +13,12 @@ pub fn has_simd_support() -> bool {
     {
         is_x86_feature_detected!("sse2")
     }
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(target_arch = "aarch64")]
+    {
+        // NEON is always available on AArch64
+        true
+    }
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     {
         false
     }
@@ -21,7 +29,9 @@ pub fn has_simd_support() -> bool {
 pub struct SimdCandidateSet {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     candidates: __m128i,
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(target_arch = "aarch64")]
+    candidates: uint16x8_t,
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     candidates: u16,
 }
 
@@ -36,7 +46,16 @@ impl SimdCandidateSet {
         }
     }
 
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub unsafe fn new() -> Self {
+        Self {
+            candidates: vdupq_n_u16(0x1FF) // All candidates available (9 bits set)
+        }
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     #[inline]
     pub fn new() -> Self {
         Self {
@@ -52,7 +71,14 @@ impl SimdCandidateSet {
         self.candidates = _mm_andnot_si128(values, self.candidates);
     }
 
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub unsafe fn remove_candidates(&mut self, values: uint16x8_t) {
+        self.candidates = vbicq_u16(self.candidates, values);
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     #[inline]
     pub fn remove_candidates(&mut self, values: u16) {
         self.candidates &= !values;
@@ -67,7 +93,16 @@ impl SimdCandidateSet {
         _mm_movemask_epi8(result) != 0
     }
 
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub unsafe fn has_candidates(&self, values: uint16x8_t) -> bool {
+        let result = vandq_u16(self.candidates, values);
+        let _zero = vdupq_n_u16(0);
+        vmaxvq_u16(result) != 0
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     #[inline]
     pub fn has_candidates(&self, values: u16) -> bool {
         self.candidates & values != 0
@@ -83,7 +118,16 @@ impl SimdCandidateSet {
         }
     }
 
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub unsafe fn from_candidate_set(set: CandidateSet) -> Self {
+        Self {
+            candidates: vdupq_n_u16(set.0)
+        }
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     #[inline]
     pub fn from_candidate_set(set: CandidateSet) -> Self {
         Self {
@@ -100,7 +144,15 @@ impl SimdCandidateSet {
         CandidateSet(value)
     }
 
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub unsafe fn to_candidate_set(&self) -> CandidateSet {
+        let value = vgetq_lane_u16(self.candidates, 0);
+        CandidateSet(value)
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     #[inline]
     pub fn to_candidate_set(&self) -> CandidateSet {
         CandidateSet(self.candidates)
@@ -112,8 +164,16 @@ impl SimdCandidateSet {
 pub struct SimdBoard {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     rows: [__m128i; 9],
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    last_elements: [u16; 9],
+    #[cfg(target_arch = "aarch64")]
+    rows: [uint16x8_t; 9],
+    #[cfg(target_arch = "aarch64")]
+    last_elements: [u16; 9],
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     rows: [[u8; 9]; 9],
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+    last_elements: [u16; 9],
 }
 
 impl SimdBoard {
@@ -122,6 +182,7 @@ impl SimdBoard {
     #[target_feature(enable = "sse2")]
     pub unsafe fn from_board(board: &Board) -> Self {
         let mut simd_rows = [_mm_setzero_si128(); 9];
+        let mut last_elements = [0u16; 9];
         
         for row in 0..9 {
             let row_data: [i16; 8] = board.cells[row * 9..row * 9 + 8]
@@ -132,20 +193,44 @@ impl SimdBoard {
                 .unwrap();
             
             simd_rows[row] = _mm_loadu_si128(row_data.as_ptr() as *const __m128i);
+            last_elements[row] = board.cells[row * 9 + 8] as u16;
         }
         
-        Self { rows: simd_rows }
+        Self { rows: simd_rows, last_elements }
     }
 
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    pub unsafe fn from_board(board: &Board) -> Self {
+        let mut simd_rows = [vdupq_n_u16(0); 9];
+        let mut last_elements = [0u16; 9];
+        
+        for row in 0..9 {
+            let mut row_data = [0u16; 8];
+            for col in 0..8 {
+                row_data[col] = board.cells[row * 9 + col] as u16;
+            }
+            simd_rows[row] = vld1q_u16(row_data.as_ptr());
+            last_elements[row] = board.cells[row * 9 + 8] as u16;
+        }
+        
+        Self { 
+            rows: simd_rows,
+            last_elements,
+        }
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     pub fn from_board(board: &Board) -> Self {
         let mut rows = [[0; 9]; 9];
+        let mut last_elements = [0u16; 9];
         for row in 0..9 {
             for col in 0..9 {
                 rows[row][col] = board.cells[row * 9 + col];
             }
+            last_elements[row] = board.cells[row * 9 + 8] as u16;
         }
-        Self { rows }
+        Self { rows, last_elements }
     }
 
     /// Validates a row using SIMD operations
@@ -154,12 +239,94 @@ impl SimdBoard {
     #[inline]
     pub unsafe fn is_valid_row(&self, row: usize) -> bool {
         let row_data = self.rows[row];
-        let shuffled = _mm_shuffle_epi32(row_data, 0x4E);
-        let duplicates = _mm_cmpeq_epi16(row_data, shuffled);
-        _mm_movemask_epi8(duplicates) == 0
+        let last_value = self.last_elements[row];
+        let mut seen = [false; 10];
+        
+        // Check first 8 elements
+        for i in 0..8 {
+            let value = _mm_extract_epi16(row_data, i) as usize;
+            if value == 0 || value > 9 || seen[value] {
+                return false;
+            }
+            seen[value] = true;
+        }
+        
+        // Check the 9th element
+        let value = last_value as usize;
+        if value == 0 || value > 9 || seen[value] {
+            return false;
+        }
+        
+        true
     }
 
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    #[inline]
+    pub unsafe fn is_valid_row(&self, row: usize) -> bool {
+        let row_data = self.rows[row];
+        let last_value = self.last_elements[row];
+        let mut seen = [false; 10];
+        
+        // Check each element with constant indices
+        let value = vgetq_lane_u16(row_data, 0) as usize;
+        if value == 0 || value > 9 || seen[value] {
+            return false;
+        }
+        seen[value] = true;
+
+        let value = vgetq_lane_u16(row_data, 1) as usize;
+        if value == 0 || value > 9 || seen[value] {
+            return false;
+        }
+        seen[value] = true;
+
+        let value = vgetq_lane_u16(row_data, 2) as usize;
+        if value == 0 || value > 9 || seen[value] {
+            return false;
+        }
+        seen[value] = true;
+
+        let value = vgetq_lane_u16(row_data, 3) as usize;
+        if value == 0 || value > 9 || seen[value] {
+            return false;
+        }
+        seen[value] = true;
+
+        let value = vgetq_lane_u16(row_data, 4) as usize;
+        if value == 0 || value > 9 || seen[value] {
+            return false;
+        }
+        seen[value] = true;
+
+        let value = vgetq_lane_u16(row_data, 5) as usize;
+        if value == 0 || value > 9 || seen[value] {
+            return false;
+        }
+        seen[value] = true;
+
+        let value = vgetq_lane_u16(row_data, 6) as usize;
+        if value == 0 || value > 9 || seen[value] {
+            return false;
+        }
+        seen[value] = true;
+
+        let value = vgetq_lane_u16(row_data, 7) as usize;
+        if value == 0 || value > 9 || seen[value] {
+            return false;
+        }
+        seen[value] = true;
+        
+        // Check the 9th element
+        let value = last_value as usize;
+        if value == 0 || value > 9 || seen[value] {
+            return false;
+        }
+        
+        true
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     #[inline]
     pub fn is_valid_row(&self, row: usize) -> bool {
         let mut seen = [false; 10];
@@ -180,7 +347,14 @@ impl SimdBoard {
             .all(|row| self.is_valid_row(row))
     }
 
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    pub unsafe fn validate_multiple_rows(&self, start_row: usize, count: usize) -> bool {
+        (start_row..start_row + count)
+            .all(|row| self.is_valid_row(row))
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     pub fn validate_multiple_rows(&self, start_row: usize, count: usize) -> bool {
         (start_row..start_row + count)
             .all(|row| self.is_valid_row(row))
@@ -194,18 +368,48 @@ impl SimdValidator {
     /// Validates a solution using SIMD operations where available
     pub fn validate_solution(board: &Board) -> bool {
         if has_simd_support() {
-            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
             unsafe {
                 let simd_board = SimdBoard::from_board(board);
-                // Validate rows in chunks of 2 for better throughput
-                for chunk in (0..9).step_by(2) {
-                    if !simd_board.validate_multiple_rows(chunk, chunk + 2.min(9 - chunk)) {
+                
+                // Validate rows
+                for row in 0..9 {
+                    if !simd_board.is_valid_row(row) {
                         return false;
                     }
                 }
+                
+                // Validate columns
+                for col in 0..9 {
+                    let mut seen = [false; 10];
+                    for row in 0..9 {
+                        let value = board.get(row, col);
+                        if value == 0 || value > 9 || seen[value as usize] {
+                            return false;
+                        }
+                        seen[value as usize] = true;
+                    }
+                }
+                
+                // Validate boxes
+                for box_row in 0..3 {
+                    for box_col in 0..3 {
+                        let mut seen = [false; 10];
+                        for i in 0..3 {
+                            for j in 0..3 {
+                                let value = board.get(box_row * 3 + i, box_col * 3 + j);
+                                if value == 0 || value > 9 || seen[value as usize] {
+                                    return false;
+                                }
+                                seen[value as usize] = true;
+                            }
+                        }
+                    }
+                }
+                
                 true
             }
-            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+            #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
             {
                 Self::validate_solution_fallback(board)
             }
@@ -261,7 +465,7 @@ impl SimdValidator {
 }
 
 /// SIMD-optimized board validation and candidate checking
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SimdSolver {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     row_masks: [__m128i; 9],
@@ -269,11 +473,17 @@ pub struct SimdSolver {
     col_masks: [__m128i; 9],
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     box_masks: [__m128i; 9],
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(target_arch = "aarch64")]
+    row_masks: [uint16x8_t; 9],
+    #[cfg(target_arch = "aarch64")]
+    col_masks: [uint16x8_t; 9],
+    #[cfg(target_arch = "aarch64")]
+    box_masks: [uint16x8_t; 9],
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     row_masks: [[u8; 9]; 9],
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     col_masks: [[u8; 9]; 9],
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     box_masks: [[u8; 9]; 9],
 }
 
@@ -334,7 +544,81 @@ impl SimdSolver {
         }
     }
 
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    pub unsafe fn new(board: &Board) -> Self {
+        let mut row_masks = [vdupq_n_u16(0); 9];
+        let mut col_masks = [vdupq_n_u16(0); 9];
+        let mut box_masks = [vdupq_n_u16(0); 9];
+
+        // Precompute masks for each row, column, and box
+        for row in 0..9 {
+            let mut row_data = [0u16; 8];
+            for col in 0..8 {
+                let value = board.get(row, col);
+                if value != 0 {
+                    row_data[col] = 1 << (value - 1);
+                }
+            }
+            row_masks[row] = vld1q_u16(row_data.as_ptr());
+            // Handle the 9th element by setting it in the first unused lane
+            let value = board.get(row, 8);
+            if value != 0 {
+                row_masks[row] = vsetq_lane_u16(1 << (value - 1), row_masks[row], 7);
+            }
+        }
+
+        // Similar for columns
+        for col in 0..9 {
+            let mut col_data = [0u16; 8];
+            for row in 0..8 {
+                let value = board.get(row, col);
+                if value != 0 {
+                    col_data[row] = 1 << (value - 1);
+                }
+            }
+            col_masks[col] = vld1q_u16(col_data.as_ptr());
+            // Handle the 9th element by setting it in the first unused lane
+            let value = board.get(8, col);
+            if value != 0 {
+                col_masks[col] = vsetq_lane_u16(1 << (value - 1), col_masks[col], 7);
+            }
+        }
+
+        // And boxes
+        for box_idx in 0..9 {
+            let box_row = (box_idx / 3) * 3;
+            let box_col = (box_idx % 3) * 3;
+            let mut box_data = [0u16; 8];
+            
+            let mut idx = 0;
+            for i in 0..3 {
+                for j in 0..3 {
+                    if idx < 8 {
+                        let value = board.get(box_row + i, box_col + j);
+                        if value != 0 {
+                            box_data[idx] = 1 << (value - 1);
+                        }
+                        idx += 1;
+                    }
+                }
+            }
+            box_masks[box_idx] = vld1q_u16(box_data.as_ptr());
+            // Handle the 9th element by setting it in the first unused lane
+            let value = board.get(box_row + 2, box_col + 2);
+            if value != 0 {
+                box_masks[box_idx] = vsetq_lane_u16(1 << (value - 1), box_masks[box_idx], 7);
+            }
+        }
+
+        Self {
+            row_masks,
+            col_masks,
+            box_masks,
+        }
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     pub fn new(board: &Board) -> Self {
         let mut row_masks = [[0; 9]; 9];
         let mut col_masks = [[0; 9]; 9];
@@ -389,7 +673,37 @@ impl SimdSolver {
         true
     }
 
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    pub unsafe fn is_valid_candidate(&self, row: usize, col: usize, value: u8) -> bool {
+        if value == 0 {
+            return false;
+        }
+        let value_mask = vdupq_n_u16(1 << (value - 1));
+        
+        // Check row
+        let row_check = vandq_u16(self.row_masks[row], value_mask);
+        if vmaxvq_u16(row_check) != 0 {
+            return false;
+        }
+
+        // Check column
+        let col_check = vandq_u16(self.col_masks[col], value_mask);
+        if vmaxvq_u16(col_check) != 0 {
+            return false;
+        }
+
+        // Check box
+        let box_idx = (row / 3) * 3 + col / 3;
+        let box_check = vandq_u16(self.box_masks[box_idx], value_mask);
+        if vmaxvq_u16(box_check) != 0 {
+            return false;
+        }
+
+        true
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     pub fn is_valid_candidate(&self, row: usize, col: usize, value: u8) -> bool {
         // Check row
         if self.row_masks[row].contains(&value) {
@@ -427,7 +741,26 @@ impl SimdSolver {
         self.box_masks[box_idx] = _mm_or_si128(self.box_masks[box_idx], value_mask);
     }
 
-    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    pub unsafe fn update_masks(&mut self, row: usize, col: usize, value: u8) {
+        if value == 0 {
+            return;
+        }
+        let value_mask = vdupq_n_u16(1 << (value - 1));
+        
+        // Update row mask
+        self.row_masks[row] = vorrq_u16(self.row_masks[row], value_mask);
+        
+        // Update column mask
+        self.col_masks[col] = vorrq_u16(self.col_masks[col], value_mask);
+        
+        // Update box mask
+        let box_idx = (row / 3) * 3 + col / 3;
+        self.box_masks[box_idx] = vorrq_u16(self.box_masks[box_idx], value_mask);
+    }
+
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
     pub fn update_masks(&mut self, row: usize, col: usize, value: u8) {
         self.row_masks[row][col] = value;
         self.col_masks[col][row] = value;
@@ -452,10 +785,13 @@ mod tests {
             return;
         }
 
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
         unsafe {
             let mut simd_set = SimdCandidateSet::new();
+            #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             let values = _mm_set1_epi16(0x1); // Remove candidate 1
+            #[cfg(target_arch = "aarch64")]
+            let values = vdupq_n_u16(0x1); // Remove candidate 1
             simd_set.remove_candidates(values);
             assert!(!simd_set.has_candidates(values));
         }
@@ -469,7 +805,7 @@ mod tests {
             board.set(0, i, (i + 1) as u8);
         }
 
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))]
         unsafe {
             if has_simd_support() {
                 let simd_board = SimdBoard::from_board(&board);

@@ -19,10 +19,11 @@ once_cell = "1.19.0"
 parking_lot = "0.12.1"
 lru = "0.12.1"
 num_cpus = "1.16.0"
+rand = { version = "0.8", features = ["small_rng"] }
 
 [features]
 default = ["simd"]
-simd = []  # SIMD optimizations (SSE2 and above)
+simd = []  # SIMD optimizations (SSE2 and NEON)
 
 [dev-dependencies]
 criterion = { version = "0.5.1", features = ["async_tokio"] }
